@@ -51,6 +51,106 @@ AIRFOILTOOLS_BASE_URL = "http://airfoiltools.com"
 AIRFOILTOOLS_SEARCH_PAGE_URL = f"{AIRFOILTOOLS_BASE_URL}/search/airfoils"
 MAX_AF_LIST_PAGES_TO_SCRAPE = 15 # Limit scraping to prevent excessive requests
 
+CUSTOM_AIRFOIL_SPECS = {
+    "modified_clark_y_30mm": {
+        "display_name": "Modified Clark Y (30 mm flat bottom)",
+        "internal_name": "Modified Clark Y 30mm Flat Bottom",
+        "aliases": (
+            "modified clark y",
+            "clark y modified",
+            "mod clark y",
+            "custom clark y",
+            "modified clark-y",
+        ),
+        "chord_mm": 30.0,
+        "max_thickness_mm": 2.0,
+        "max_camber_mm": 1.0,
+        "leading_edge_radius_mm": 0.8,
+        "trailing_edge_thickness_mm": 0.5,
+        "max_thickness_x_mm": 9.0,
+        "flat_bottom": True,
+    }
+}
+
+PLOT_COLOR_OPTIONS = {
+    "Blue": "blue",
+    "Red": "red",
+    "Black": "black",
+    "Green": "green",
+    "Purple": "purple",
+}
+
+
+def normalize_airfoil_key(name):
+    return re.sub(r'[^a-z0-9]', '', name.lower())
+
+
+def build_custom_airfoil_entries():
+    entries = {}
+    for custom_id, spec in CUSTOM_AIRFOIL_SPECS.items():
+        names = (spec["display_name"], custom_id, *spec.get("aliases", ()))
+        airfoil_info = {
+            "display_name": spec["display_name"],
+            "details_page_suffix": None,
+            "dat_file_url_suffix": None,
+            "airfoil_slug_at_site": None,
+            "custom_airfoil_id": custom_id,
+        }
+        for name in names:
+            entries[normalize_airfoil_key(name)] = airfoil_info
+    return entries
+
+
+def generate_modified_clark_y_coordinates(spec):
+    """
+    Generates a flat-bottom modified Clark Y outline in millimeters.
+    The lower surface is flat after the leading-edge radius.
+    """
+    chord = spec["chord_mm"]
+    max_thickness = spec["max_thickness_mm"]
+    leading_radius = spec["leading_edge_radius_mm"]
+    trailing_edge_thickness = spec["trailing_edge_thickness_mm"]
+    max_thickness_x = spec["max_thickness_x_mm"]
+
+    def smoothstep(u):
+        return (3 * u ** 2) - (2 * u ** 3)
+
+    center_x = leading_radius
+    center_y = leading_radius
+
+    upper_arc_theta = np.linspace(np.pi, np.pi / 2, 18)
+    upper_arc_x = center_x + leading_radius * np.cos(upper_arc_theta)
+    upper_arc_y = center_y + leading_radius * np.sin(upper_arc_theta)
+
+    upper_ramp_x = np.linspace(leading_radius, max_thickness_x, 42)[1:]
+    upper_ramp_u = (upper_ramp_x - leading_radius) / (max_thickness_x - leading_radius)
+    upper_ramp_y = (2 * leading_radius) + (max_thickness - 2 * leading_radius) * smoothstep(upper_ramp_u)
+
+    upper_aft_x = np.linspace(max_thickness_x, chord, 82)[1:]
+    upper_aft_u = (upper_aft_x - max_thickness_x) / (chord - max_thickness_x)
+    upper_aft_y = trailing_edge_thickness + (max_thickness - trailing_edge_thickness) * (1 - smoothstep(upper_aft_u))
+
+    upper_x_forward = np.concatenate([upper_arc_x, upper_ramp_x, upper_aft_x])
+    upper_y_forward = np.concatenate([upper_arc_y, upper_ramp_y, upper_aft_y])
+
+    lower_arc_theta = np.linspace(np.pi, 3 * np.pi / 2, 18)
+    lower_arc_x = center_x + leading_radius * np.cos(lower_arc_theta)
+    lower_arc_y = center_y + leading_radius * np.sin(lower_arc_theta)
+
+    lower_flat_x = np.linspace(leading_radius, chord, 92)[1:]
+    lower_flat_y = np.zeros_like(lower_flat_x)
+
+    lower_x = np.concatenate([lower_arc_x, lower_flat_x]).tolist()
+    lower_y = np.concatenate([lower_arc_y, lower_flat_y]).tolist()
+
+    return (
+        spec["internal_name"],
+        upper_x_forward[::-1].tolist(),
+        upper_y_forward[::-1].tolist(),
+        lower_x,
+        lower_y,
+    )
+
 # --- Core Data Fetching and Parsing Logic ---
 
 def parse_airfoil_data(data_content, airfoil_name_for_context="file"):
@@ -152,7 +252,7 @@ def get_airfoil_list_from_airfoiltools_threaded(results_dict, key_name_in_result
                 base_name_for_key = slug
                 if base_name_for_key.lower().endswith("-il"): base_name_for_key = base_name_for_key[:-3]
                 elif base_name_for_key.lower().endswith("-uiuc"): base_name_for_key = base_name_for_key[:-5]
-                normalized_key = re.sub(r'[^a-z0-9]', '', base_name_for_key.lower())
+                normalized_key = normalize_airfoil_key(base_name_for_key)
                 if normalized_key and normalized_key not in airfoils_data:
                     airfoils_data[normalized_key] = {
                         'display_name': display_name,
@@ -295,6 +395,9 @@ class AirfoilPlotterApp:
         self.current_plotted_airfoil_name = None
         self.current_airfoil_slug_at_site = None
         self.last_plotted_data = None
+        self.raw_plotted_data = None
+        self.last_plotted_camber_line = None
+        self.last_transform_settings = None
         self.setup_ui()
         self._initialize_plot_area()
         self.update_status("Initializing... Please wait.")
@@ -348,6 +451,47 @@ class AirfoilPlotterApp:
         self.suggestions_listbox.bind("<Double-Button-1>", lambda e: self.plot_selected_suggestion())
         self.plot_suggestion_button = ttk.Button(suggestions_frame, text="Plot Selected Suggestion", command=self.plot_selected_suggestion, state=tk.DISABLED)
         self.plot_suggestion_button.pack(side=tk.BOTTOM, fill=tk.X, pady=5)
+
+        transform_frame = ttk.LabelFrame(self.left_panel, text="Transform", padding="8")
+        transform_frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 5))
+        self.chord_mm_var = tk.StringVar(value="30")
+        self.camber_radius_mm_var = tk.StringVar(value="0")
+        self.thickness_pct_var = tk.StringVar(value="100")
+        self.origin_pct_var = tk.StringVar(value="0")
+        self.pitch_deg_var = tk.StringVar(value="0")
+        self.x_grid_mm_var = tk.StringVar(value="10")
+        self.y_grid_mm_var = tk.StringVar(value="10")
+        self.line_thickness_pct_var = tk.StringVar(value="100")
+        self.color_var = tk.StringVar(value="Blue")
+        transform_fields = [
+            ("Chord (mm)", self.chord_mm_var),
+            ("Radius (mm)", self.camber_radius_mm_var),
+            ("Thickness (%)", self.thickness_pct_var),
+            ("Origin (%)", self.origin_pct_var),
+            ("Pitch (deg)", self.pitch_deg_var),
+            ("X grid (mm)", self.x_grid_mm_var),
+            ("Y grid (mm)", self.y_grid_mm_var),
+            ("Line width (%)", self.line_thickness_pct_var),
+        ]
+        for row_index, (label_text, variable) in enumerate(transform_fields):
+            ttk.Label(transform_frame, text=label_text).grid(row=row_index, column=0, sticky="e", padx=(0, 5), pady=2)
+            entry = ttk.Entry(transform_frame, textvariable=variable, width=10)
+            entry.grid(row=row_index, column=1, sticky="ew", pady=2)
+            entry.bind("<Return>", lambda _event: self.redraw_current_airfoil())
+        ttk.Label(transform_frame, text="Colour").grid(row=len(transform_fields), column=0, sticky="e", padx=(0, 5), pady=2)
+        self.color_combobox = ttk.Combobox(transform_frame, textvariable=self.color_var, values=list(PLOT_COLOR_OPTIONS.keys()), width=10, state="readonly")
+        self.color_combobox.grid(row=len(transform_fields), column=1, sticky="ew", pady=2)
+        self.color_combobox.bind("<<ComboboxSelected>>", lambda _event: self.redraw_current_airfoil())
+        self.reverse_var = tk.BooleanVar(value=False)
+        self.data_box_visible_var = tk.BooleanVar(value=True)
+        self.camber_line_visible_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(transform_frame, text="Reverse", variable=self.reverse_var, command=self.redraw_current_airfoil).grid(row=len(transform_fields) + 1, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Checkbutton(transform_frame, text="Data box", variable=self.data_box_visible_var, command=self.redraw_current_airfoil).grid(row=len(transform_fields) + 2, column=0, columnspan=2, sticky="w")
+        ttk.Checkbutton(transform_frame, text="Camber line", variable=self.camber_line_visible_var, command=self.redraw_current_airfoil).grid(row=len(transform_fields) + 3, column=0, columnspan=2, sticky="w")
+        self.transform_button = ttk.Button(transform_frame, text="Apply Transform", command=self.redraw_current_airfoil, state=tk.DISABLED)
+        self.transform_button.grid(row=len(transform_fields) + 4, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        transform_frame.columnconfigure(1, weight=1)
+
         aero_data_frame = ttk.LabelFrame(self.left_panel, text="Aerodynamic Data", padding="10")
         aero_data_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(5, 0))
         self.aero_data_labels = {}
@@ -389,10 +533,14 @@ class AirfoilPlotterApp:
         self.canvas.draw_idle()
         self.current_plotted_airfoil_name = None
         self.last_plotted_data = None
+        self.raw_plotted_data = None
+        self.last_plotted_camber_line = None
+        self.last_transform_settings = None
         self.current_airfoil_slug_at_site = None
         self.export_button.config(state=tk.DISABLED)
         self.export_svg_button.config(state=tk.DISABLED)
         self.fetch_aero_button.config(state=tk.DISABLED)
+        self.transform_button.config(state=tk.DISABLED)
         if clear_aero_data:
             self._clear_aero_data_display()
 
@@ -418,14 +566,14 @@ class AirfoilPlotterApp:
         if result is None:
             self.master.after(100, self.check_database_load_completion)
             return
-        self.airfoils_db = result.get('data', {})
+        fetched_airfoils = result.get('data', {})
+        custom_airfoils = build_custom_airfoil_entries()
+        self.airfoils_db = {**fetched_airfoils, **custom_airfoils}
         error = result.get('error')
-        if error and not self.airfoils_db:
+        if error and not fetched_airfoils:
             msg = f"Error fetching airfoil list: {error}"
             self.update_status(msg)
-            messagebox.showerror("Database Error", f"Could not retrieve airfoil list:\n{msg}", parent=self.master)
-            self.set_ui_state_for_processing(False)
-            return
+            messagebox.showwarning("Database Warning", f"Could not retrieve online airfoils:\n{msg}\n\nBuilt-in presets are still available.", parent=self.master)
         if not self.airfoils_db:
             msg = "Error: No airfoils found on airfoiltools.com. The site might be down or its structure may have changed."
             self.update_status(msg)
@@ -433,7 +581,7 @@ class AirfoilPlotterApp:
             self.set_ui_state_for_processing(False)
             return
         self.available_normalized_names = list(self.airfoils_db.keys())
-        self.update_status(f"Loaded {len(self.airfoils_db)} airfoils. Ready.")
+        self.update_status(f"Loaded {len(fetched_airfoils)} online airfoils and {len(CUSTOM_AIRFOIL_SPECS)} built-in preset(s). Ready.")
         self.set_ui_state_for_processing(False)
         self.search_button.config(state=tk.NORMAL)
         self.list_button.config(state=tk.NORMAL)
@@ -443,7 +591,7 @@ class AirfoilPlotterApp:
         if not user_input:
             self.update_status("Please enter an airfoil name to search.")
             return
-        normalized_input = re.sub(r'[^a-z0-9]', '', user_input.lower())
+        normalized_input = normalize_airfoil_key(user_input)
         self.suggestions_listbox.delete(0, tk.END)
         self.plot_suggestion_button.config(state=tk.DISABLED)
         self._initialize_plot_area(clear_aero_data=True)
@@ -465,6 +613,11 @@ class AirfoilPlotterApp:
                 messagebox.showinfo("Not Found", f"The airfoil '{user_input}' was not found and no close matches could be suggested.", parent=self.master)
 
     def _initiate_airfoil_processing(self, airfoil_info):
+        custom_airfoil_id = airfoil_info.get("custom_airfoil_id")
+        if custom_airfoil_id:
+            self._plot_custom_airfoil(custom_airfoil_id)
+            return
+
         display_name = airfoil_info['display_name']
         self.update_status(f"Downloading coordinates for {display_name}...")
         self.set_ui_state_for_processing(True)
@@ -474,6 +627,22 @@ class AirfoilPlotterApp:
         thread.daemon = True
         thread.start()
         self.master.after(100, self._check_download_completion, airfoil_info)
+
+    def _plot_custom_airfoil(self, custom_airfoil_id):
+        spec = CUSTOM_AIRFOIL_SPECS.get(custom_airfoil_id)
+        if not spec:
+            messagebox.showerror("Custom Airfoil Error", f"Unknown custom airfoil: {custom_airfoil_id}", parent=self.master)
+            return
+
+        self.update_status(f"Plotting built-in airfoil: {spec['display_name']}...")
+        self.set_ui_state_for_processing(True)
+        self.current_airfoil_slug_at_site = None
+        name_int, xu, yu, xl, yl = generate_modified_clark_y_coordinates(spec)
+        if self._draw_airfoil_plot(spec["display_name"], name_int, xu, yu, xl, yl):
+            self.update_status(
+                f"Displayed: {spec['display_name']} at chord {self.last_transform_settings['chord_mm']:g} mm."
+            )
+        self.set_ui_state_for_processing(False)
 
     def _check_download_completion(self, airfoil_info):
         try:
@@ -493,8 +662,7 @@ class AirfoilPlotterApp:
                     self._initialize_plot_area()
                 else:
                     self.update_status(f"Plotting {airfoil_info['display_name']}...")
-                    self._draw_airfoil_plot(airfoil_info['display_name'], name_int, xu, yu, xl, yl)
-                    plot_was_successful = True
+                    plot_was_successful = self._draw_airfoil_plot(airfoil_info['display_name'], name_int, xu, yu, xl, yl)
             else:
                 self.update_status(f"Download for {airfoil_info['display_name']} yielded no content.")
                 self._initialize_plot_area()
@@ -524,7 +692,7 @@ class AirfoilPlotterApp:
         sb.config(command=lb.yview)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
         lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        names = sorted([d['display_name'] for d in self.airfoils_db.values()])
+        names = sorted({d['display_name'] for d in self.airfoils_db.values()})
         for name in names:
             lb.insert(tk.END, name)
         def on_select(evt):
@@ -559,28 +727,204 @@ class AirfoilPlotterApp:
             self.update_status(f"Error: Suggested key '{norm_name_key}' not found in database.")
 
     def on_toggle_markers(self):
-        if self.last_plotted_data:
-            name_d, name_i, xu, yu, xl, yl = self.last_plotted_data
-            self._draw_airfoil_plot(name_d, name_i, xu, yu, xl, yl)
-            self.update_status(f"Markers {'shown' if self.markers_visible_var.get() else 'hidden'}.")
+        if self.raw_plotted_data:
+            name_d, name_i, xu, yu, xl, yl = self.raw_plotted_data
+            if self._draw_airfoil_plot(name_d, name_i, xu, yu, xl, yl):
+                self.update_status(f"Markers {'shown' if self.markers_visible_var.get() else 'hidden'}.")
+
+    def redraw_current_airfoil(self):
+        if not self.raw_plotted_data:
+            return
+        name_d, name_i, xu, yu, xl, yl = self.raw_plotted_data
+        if self._draw_airfoil_plot(name_d, name_i, xu, yu, xl, yl):
+            self.update_status("Transform applied.")
+
+    def _get_transform_settings(self):
+        def read_float(variable, label, minimum=None, allow_equal=True):
+            raw_value = variable.get().strip()
+            try:
+                value = float(raw_value)
+            except ValueError:
+                messagebox.showerror("Invalid Transform Value", f"{label} must be a number.", parent=self.master)
+                self.update_status(f"Invalid transform value: {label} must be a number.")
+                return None
+
+            if minimum is not None:
+                is_too_small = value < minimum if allow_equal else value <= minimum
+                if is_too_small:
+                    comparator = "at least" if allow_equal else "greater than"
+                    messagebox.showerror("Invalid Transform Value", f"{label} must be {comparator} {minimum}.", parent=self.master)
+                    self.update_status(f"Invalid transform value: {label} is out of range.")
+                    return None
+            return value
+
+        chord_mm = read_float(self.chord_mm_var, "Chord (mm)", minimum=0, allow_equal=False)
+        camber_radius_mm = read_float(self.camber_radius_mm_var, "Radius (mm)")
+        thickness_pct = read_float(self.thickness_pct_var, "Thickness (%)", minimum=0, allow_equal=False)
+        origin_pct = read_float(self.origin_pct_var, "Origin (%)")
+        pitch_deg = read_float(self.pitch_deg_var, "Pitch (deg)")
+        x_grid_mm = read_float(self.x_grid_mm_var, "X grid (mm)", minimum=0)
+        y_grid_mm = read_float(self.y_grid_mm_var, "Y grid (mm)", minimum=0)
+        line_thickness_pct = read_float(self.line_thickness_pct_var, "Line width (%)", minimum=0, allow_equal=False)
+
+        values = [chord_mm, camber_radius_mm, thickness_pct, origin_pct, pitch_deg, x_grid_mm, y_grid_mm, line_thickness_pct]
+        if any(value is None for value in values):
+            return None
+
+        return {
+            "chord_mm": chord_mm,
+            "camber_radius_mm": camber_radius_mm,
+            "thickness_pct": thickness_pct,
+            "origin_pct": origin_pct,
+            "pitch_deg": pitch_deg,
+            "x_grid_mm": x_grid_mm,
+            "y_grid_mm": y_grid_mm,
+            "line_thickness_pct": line_thickness_pct,
+            "color": PLOT_COLOR_OPTIONS.get(self.color_var.get(), "blue"),
+            "reverse": self.reverse_var.get(),
+            "data_box": self.data_box_visible_var.get(),
+            "camber_line": self.camber_line_visible_var.get(),
+        }
+
+    def _sorted_unique_surface(self, x_values, y_values):
+        grouped_y = {}
+        grouped_x = {}
+        for x_value, y_value in zip(x_values, y_values):
+            key = round(float(x_value), 10)
+            grouped_x[key] = float(x_value)
+            grouped_y.setdefault(key, []).append(float(y_value))
+
+        sorted_keys = sorted(grouped_y.keys())
+        unique_x = [grouped_x[key] for key in sorted_keys]
+        unique_y = [sum(grouped_y[key]) / len(grouped_y[key]) for key in sorted_keys]
+        return np.array(unique_x), np.array(unique_y)
+
+    def _curve_points_for_radius(self, x_mm, y_mm, radius_mm):
+        x_mm = np.asarray(x_mm, dtype=float)
+        y_mm = np.asarray(y_mm, dtype=float)
+
+        if abs(radius_mm) < 1e-9:
+            return x_mm, y_mm
+
+        bend_sign = 1 if radius_mm > 0 else -1
+        bend_radius = abs(radius_mm)
+        theta = x_mm / bend_radius
+        base_x = bend_radius * np.sin(theta)
+        base_y = bend_sign * bend_radius * (1 - np.cos(theta))
+        normal_x = -bend_sign * np.sin(theta)
+        normal_y = np.cos(theta)
+        return base_x + y_mm * normal_x, base_y + y_mm * normal_y
+
+    def _apply_final_transforms(self, x_mm, y_mm, settings):
+        curved_x, curved_y = self._curve_points_for_radius(x_mm, y_mm, settings["camber_radius_mm"])
+
+        origin_x = settings["chord_mm"] * settings["origin_pct"] / 100.0
+        origin_curve_x, origin_curve_y = self._curve_points_for_radius(
+            np.array([origin_x]), np.array([0.0]), settings["camber_radius_mm"]
+        )
+        transformed_x = curved_x - origin_curve_x[0]
+        transformed_y = curved_y - origin_curve_y[0]
+
+        if settings["reverse"]:
+            transformed_x = -transformed_x
+
+        pitch_radians = np.deg2rad(settings["pitch_deg"])
+        cos_pitch = np.cos(pitch_radians)
+        sin_pitch = np.sin(pitch_radians)
+        rotated_x = transformed_x * cos_pitch - transformed_y * sin_pitch
+        rotated_y = transformed_x * sin_pitch + transformed_y * cos_pitch
+        return rotated_x, rotated_y
+
+    def _transform_airfoil_coordinates(self, xu, yu, xl, yl, settings):
+        upper_x_unique, upper_y_unique = self._sorted_unique_surface(xu, yu)
+        lower_x_unique, lower_y_unique = self._sorted_unique_surface(xl, yl)
+
+        if len(upper_x_unique) < 2 or len(lower_x_unique) < 2:
+            raise ValueError("Airfoil surfaces do not contain enough unique coordinate points.")
+
+        all_raw_x = np.concatenate([upper_x_unique, lower_x_unique])
+        min_x = float(np.min(all_raw_x))
+        max_x = float(np.max(all_raw_x))
+        raw_chord = max_x - min_x
+        if raw_chord <= 0:
+            raise ValueError("Airfoil chord length could not be calculated.")
+
+        scale = settings["chord_mm"] / raw_chord
+        thickness_factor = settings["thickness_pct"] / 100.0
+
+        def camber_at(raw_x_values):
+            upper_interp = np.interp(raw_x_values, upper_x_unique, upper_y_unique)
+            lower_interp = np.interp(raw_x_values, lower_x_unique, lower_y_unique)
+            return (upper_interp + lower_interp) / 2.0
+
+        def transform_surface(raw_x_values, raw_y_values):
+            raw_x_array = np.asarray(raw_x_values, dtype=float)
+            raw_y_array = np.asarray(raw_y_values, dtype=float)
+            raw_camber = camber_at(raw_x_array)
+            adjusted_y = raw_camber + (raw_y_array - raw_camber) * thickness_factor
+            x_mm = (raw_x_array - min_x) * scale
+            y_mm = adjusted_y * scale
+            transformed_x, transformed_y = self._apply_final_transforms(x_mm, y_mm, settings)
+            return transformed_x.tolist(), transformed_y.tolist()
+
+        transformed_upper_x, transformed_upper_y = transform_surface(xu, yu)
+        transformed_lower_x, transformed_lower_y = transform_surface(xl, yl)
+
+        camber_raw_x = np.linspace(min_x, max_x, 180)
+        camber_raw_y = camber_at(camber_raw_x)
+        camber_x_mm = (camber_raw_x - min_x) * scale
+        camber_y_mm = camber_raw_y * scale
+        camber_x, camber_y = self._apply_final_transforms(camber_x_mm, camber_y_mm, settings)
+
+        return transformed_upper_x, transformed_upper_y, transformed_lower_x, transformed_lower_y, camber_x.tolist(), camber_y.tolist()
+
+    def _apply_grid_spacing(self, settings):
+        def apply_axis_ticks(get_limits, set_ticks, spacing):
+            if spacing <= 0:
+                return
+            axis_min, axis_max = get_limits()
+            start = np.floor(axis_min / spacing) * spacing
+            end = np.ceil(axis_max / spacing) * spacing
+            tick_count = int(round((end - start) / spacing)) + 1
+            if tick_count <= 1 or tick_count > 200:
+                return
+            set_ticks(np.arange(start, end + spacing * 0.5, spacing))
+
+        apply_axis_ticks(self.ax.get_xlim, self.ax.set_xticks, settings["x_grid_mm"])
+        apply_axis_ticks(self.ax.get_ylim, self.ax.set_yticks, settings["y_grid_mm"])
 
     def _draw_airfoil_plot(self, name_display, name_internal, xu, yu, xl, yl):
+        settings = self._get_transform_settings()
+        if settings is None:
+            return False
+
+        try:
+            txu, tyu, txl, tyl, camber_x, camber_y = self._transform_airfoil_coordinates(xu, yu, xl, yl, settings)
+        except ValueError as exc:
+            messagebox.showerror("Transform Error", str(exc), parent=self.master)
+            self.update_status(f"Transform error: {exc}")
+            return False
+
         self.ax.clear()
         self._style_plot_for_grey_bg()
         
         # Combine points into a single continuous line as per user suggestion
-        if xu and xl and xu[-1] == xl[0]:
-            full_x = xu + xl[1:]
-            full_y = yu + yl[1:]
+        if txu and txl and abs(txu[-1] - txl[0]) < 1e-9 and abs(tyu[-1] - tyl[0]) < 1e-9:
+            full_x = txu + txl[1:]
+            full_y = tyu + tyl[1:]
         else: # Fallback if points don't meet
-            full_x = xu + xl
-            full_y = yu + yl
+            full_x = txu + txl
+            full_y = tyu + tyl
             
         show_markers = self.markers_visible_var.get()
         style = 'o-' if show_markers else '-'
         marker_size = 3 if show_markers else 0
+        line_width = max(0.2, 1.5 * settings["line_thickness_pct"] / 100.0)
 
-        self.ax.plot(full_x, full_y, style, label='Airfoil Outline', markersize=marker_size, color='blue')
+        self.ax.plot(full_x, full_y, style, label='Airfoil Outline', markersize=marker_size, linewidth=line_width, color=settings["color"])
+
+        if settings["camber_line"]:
+            self.ax.plot(camber_x, camber_y, '--', label='Camber Line', linewidth=1, color='gray')
 
         title = f'Airfoil: {name_display}'
         if name_internal and name_internal.lower().strip() != name_display.lower().strip():
@@ -593,18 +937,33 @@ class AirfoilPlotterApp:
         legend.get_frame().set_facecolor(UI_BACKGROUND_COLOR)
         legend.get_frame().set_edgecolor('gray')
 
-        self.ax.set_xlabel('X-coordinate')
-        self.ax.set_ylabel('Y-coordinate')
+        if settings["data_box"]:
+            details = (
+                f"Name = {name_display}\n"
+                f"Chord = {settings['chord_mm']:g}mm  Radius = {settings['camber_radius_mm']:g}mm  "
+                f"Thickness = {settings['thickness_pct']:g}%\n"
+                f"Origin = {settings['origin_pct']:g}%  Pitch = {settings['pitch_deg']:g} deg"
+            )
+            self.ax.text(0.01, 0.02, details, transform=self.ax.transAxes, fontsize=8, va='bottom', color=settings["color"])
+
+        self.ax.set_xlabel('X (mm)')
+        self.ax.set_ylabel('Y (mm)')
         self.ax.axis('equal')
+        self._apply_grid_spacing(settings)
         self.canvas.draw_idle()
 
         self.current_plotted_airfoil_name = name_display
-        self.last_plotted_data = (name_display, name_internal, xu, yu, xl, yl) # Still save original components
+        self.raw_plotted_data = (name_display, name_internal, list(xu), list(yu), list(xl), list(yl))
+        self.last_plotted_data = (name_display, name_internal, txu, tyu, txl, tyl)
+        self.last_plotted_camber_line = (camber_x, camber_y)
+        self.last_transform_settings = settings
         
         self.export_button.config(state=tk.NORMAL)
         self.export_svg_button.config(state=tk.NORMAL)
+        self.transform_button.config(state=tk.NORMAL)
         if self.current_airfoil_slug_at_site:
             self.fetch_aero_button.config(state=tk.NORMAL)
+        return True
 
     def export_plot_as_png(self):
         if not self.current_plotted_airfoil_name or not self.ax.lines:
@@ -670,35 +1029,29 @@ class AirfoilPlotterApp:
                  messagebox.showwarning("Export Warning", "Cannot export SVG for an airfoil with no area.", parent=self.master)
                  return
 
-            # Step 3: Define a target canvas and rescale the airfoil to fit.
-            # This avoids all complex transforms and floating point viewBox issues.
-            svg_canvas_width = 1000
-            padding = 50 # 50px padding on each side
-            
-            # Calculate the scaling factor to fit the data into the canvas width
-            scale_factor = (svg_canvas_width - 2 * padding) / data_width
-            svg_canvas_height = (data_height * scale_factor) + (2 * padding)
-
-            # Step 4: Create the new, scaled and transformed points.
+            # Step 3: Move the already-transformed millimeter coordinates into
+            # SVG space while preserving their real dimensions.
             transformed_points = []
             for x, y in points:
-                # Scale and translate X coordinate
-                new_x = padding + (x - min_x) * scale_factor
-                # Scale, flip Y, and translate Y coordinate
-                new_y = (svg_canvas_height - padding) - (y - min_y) * scale_factor
+                new_x = x - min_x
+                new_y = max_y - y
                 transformed_points.append(f"{new_x:.3f},{new_y:.3f}")
 
-            # Step 5: Generate the SVG path data from the transformed points.
+            # Step 4: Generate the SVG path data from the transformed points.
             path_d = "M " + " L ".join(transformed_points) + " Z"
 
-            # Step 6: Create the final SVG content with a simple, fixed viewBox.
+            stroke_width = 0.05
+            if self.last_transform_settings:
+                stroke_width = max(0.02, 0.05 * self.last_transform_settings["line_thickness_pct"] / 100.0)
+
+            # Step 5: Create the final SVG content with millimeters as the size unit.
             svg_content = (
-                f'<svg width="{svg_canvas_width}" height="{svg_canvas_height}" viewBox="0 0 {svg_canvas_width} {svg_canvas_height}" xmlns="http://www.w3.org/2000/svg">\n'
-                f'  <path d="{path_d}" fill="none" stroke="black" stroke-width="2"/>\n'
+                f'<svg width="{data_width:.3f}mm" height="{data_height:.3f}mm" viewBox="0 0 {data_width:.3f} {data_height:.3f}" xmlns="http://www.w3.org/2000/svg">\n'
+                f'  <path d="{path_d}" fill="none" stroke="black" stroke-width="{stroke_width:.3f}"/>\n'
                 f'</svg>'
             )
 
-            with open(filepath, 'w') as f:
+            with open(filepath, 'w', encoding='utf-8') as f:
                 f.write(svg_content)
 
             self.update_status(f"Airfoil shape saved as SVG: {filepath}")
@@ -766,10 +1119,11 @@ class AirfoilPlotterApp:
         self.search_button.config(state=state)
         self.list_button.config(state=state)
         self.plot_suggestion_button.config(state=tk.DISABLED if is_processing else tk.NORMAL if self.suggestions_listbox.size() > 0 else tk.DISABLED)
+        self.transform_button.config(state=tk.DISABLED if is_processing or not self.raw_plotted_data else tk.NORMAL)
         if not is_processing and self.current_plotted_airfoil_name:
              self.export_button.config(state=tk.NORMAL)
              self.export_svg_button.config(state=tk.NORMAL)
-             self.fetch_aero_button.config(state=tk.NORMAL)
+             self.fetch_aero_button.config(state=tk.NORMAL if self.current_airfoil_slug_at_site else tk.DISABLED)
         else:
              self.export_button.config(state=tk.DISABLED)
              self.export_svg_button.config(state=tk.DISABLED)
